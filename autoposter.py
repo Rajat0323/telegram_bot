@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
+import html
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,7 @@ NEWS_RSS_URL = env_str(
 MAX_NEWS_POSTS_PER_RUN = env_int("MAX_NEWS_POSTS_PER_RUN", 1)
 TELEGRAM_POST_DELAY_SECONDS = env_float("TELEGRAM_POST_DELAY_SECONDS", 1.5)
 COUNTDOWN_BUCKET_MINUTES = env_int("COUNTDOWN_BUCKET_MINUTES", 60)
+NEWS_SUMMARY_WORD_LIMIT = env_int("NEWS_SUMMARY_WORD_LIMIT", 60)
 
 brand = BrandConfig(handle=BRAND_HANDLE, hashtags=DEFAULT_HASHTAGS)
 
@@ -271,6 +274,19 @@ def build_news_url(query: str) -> str:
     return NEWS_RSS_URL
 
 
+def strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def summarize_words(text: str, limit: int) -> str:
+    words = text.split()
+    if len(words) <= limit:
+        return " ".join(words)
+    return " ".join(words[:limit]).rstrip(" ,.") + "..."
+
+
 def title_matches_context(title: str, live_matches: list[dict[str, Any]], next_match: dict[str, Any] | None) -> bool:
     lowered = title.lower()
     if "ipl" not in lowered and "indian premier league" not in lowered:
@@ -368,18 +384,37 @@ async def fetch_news_items(
         title = item.findtext("title", default="").strip()
         link = item.findtext("link", default="").strip()
         guid = item.findtext("guid", default=link).strip()
+        description = strip_html(item.findtext("description", default="").strip())
+        source = item.findtext("source", default="").strip()
         if not title or not link:
             continue
         if not title_matches_context(title, live_matches, next_match):
             continue
-        items.append({"id": guid, "title": title, "link": link})
+        items.append(
+            {
+                "id": guid,
+                "title": title,
+                "link": link,
+                "description": description,
+                "source": source,
+            }
+        )
         if len(items) >= MAX_NEWS_POSTS_PER_RUN:
             break
     return items
 
 
-def build_news_message(title: str, link: str) -> str:
-    return f"IPL Match News\n{title}\n{link}"
+def build_news_message(title: str, description: str, link: str, source: str) -> str:
+    body = description or title
+    summary_seed = f"{title}. {body}".strip()
+    summary = summarize_words(summary_seed, NEWS_SUMMARY_WORD_LIMIT)
+    source_line = f"Source: {source}" if source else "Source: News feed"
+    return (
+        "IPL Match News\n"
+        f"{summary}\n"
+        f"{source_line}\n"
+        f"Read more: {link}"
+    )
 
 
 async def run_once() -> None:
@@ -448,7 +483,15 @@ async def run_once() -> None:
             if item["id"] in state["news"]:
                 continue
             state["news"][item["id"]] = today
-            await post_to_targets(client, build_news_message(item["title"], item["link"]))
+            await post_to_targets(
+                client,
+                build_news_message(
+                    item["title"],
+                    item.get("description", ""),
+                    item["link"],
+                    item.get("source", ""),
+                ),
+            )
 
     save_state(state)
 
