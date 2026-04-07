@@ -15,6 +15,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Restore autoposter state
+        id: cache-state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: autoposter-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            autoposter-state-${{ github.ref_name }}-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -34,4 +43,12 @@ jobs:
           CRICKET_API_BASE_URL: ${{ secrets.CRICKET_API_BASE_URL }}
           TOURNAMENT_KEYWORDS: ${{ secrets.TOURNAMENT_KEYWORDS }}
           NEWS_RSS_URL: ${{ secrets.NEWS_RSS_URL }}
+          MAX_NEWS_POSTS_PER_RUN: ${{ secrets.MAX_NEWS_POSTS_PER_RUN }}
+          TELEGRAM_POST_DELAY_SECONDS: ${{ secrets.TELEGRAM_POST_DELAY_SECONDS }}
         run: python autoposter.py
+
+      - name: Save autoposter state
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: autoposter-state-${{ github.ref_name }}-${{ github.run_id }}

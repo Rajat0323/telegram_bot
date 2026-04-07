@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 from datetime import datetime
@@ -34,6 +35,8 @@ NEWS_RSS_URL = os.getenv(
     "NEWS_RSS_URL",
     "https://news.google.com/rss/search?q=IPL&hl=en-IN&gl=IN&ceid=IN:en",
 )
+MAX_NEWS_POSTS_PER_RUN = int(os.getenv("MAX_NEWS_POSTS_PER_RUN", "1"))
+TELEGRAM_POST_DELAY_SECONDS = float(os.getenv("TELEGRAM_POST_DELAY_SECONDS", "1.5"))
 
 brand = BrandConfig(handle=BRAND_HANDLE, hashtags=DEFAULT_HASHTAGS)
 
@@ -101,10 +104,25 @@ async def post_message(client: httpx.AsyncClient, chat_id: str, message: str) ->
     if not chat_id:
         return
 
-    response = await client.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": chat_id, "text": attach_cta(message, brand)},
-    )
+    payload = {"chat_id": chat_id, "text": attach_cta(message, brand)}
+
+    for attempt in range(3):
+        response = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload,
+        )
+
+        if response.status_code != 429:
+            response.raise_for_status()
+            await asyncio.sleep(TELEGRAM_POST_DELAY_SECONDS)
+            return
+
+        retry_after = 5
+        with contextlib.suppress(Exception):
+            data = response.json()
+            retry_after = int(data.get("parameters", {}).get("retry_after", retry_after))
+        await asyncio.sleep(retry_after + 1)
+
     response.raise_for_status()
 
 
@@ -157,7 +175,7 @@ async def fetch_news_items(client: httpx.AsyncClient) -> list[dict[str, str]]:
         if not title or not link:
             continue
         items.append({"id": guid, "title": title, "link": link})
-    return items[:5]
+    return items[:MAX_NEWS_POSTS_PER_RUN]
 
 
 def build_news_message(title: str, link: str) -> str:
