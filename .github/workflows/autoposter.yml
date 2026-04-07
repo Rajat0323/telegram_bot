@@ -1,0 +1,37 @@
+name: IPL Autoposter
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-autoposter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run autoposter
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_CHAT_ID: ${{ secrets.CHANNEL_CHAT_ID }}
+          GROUP_CHAT_ID: ${{ secrets.GROUP_CHAT_ID }}
+          BRAND_HANDLE: ${{ secrets.BRAND_HANDLE }}
+          DEFAULT_HASHTAGS: ${{ secrets.DEFAULT_HASHTAGS }}
+          CRICKET_API_KEY: ${{ secrets.CRICKET_API_KEY }}
+          CRICKET_API_BASE_URL: ${{ secrets.CRICKET_API_BASE_URL }}
+          TOURNAMENT_KEYWORDS: ${{ secrets.TOURNAMENT_KEYWORDS }}
+          NEWS_RSS_URL: ${{ secrets.NEWS_RSS_URL }}
+        run: python autoposter.py
