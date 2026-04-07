@@ -69,6 +69,9 @@ TELEGRAM_POST_DELAY_SECONDS = env_float("TELEGRAM_POST_DELAY_SECONDS", 1.5)
 COUNTDOWN_BUCKET_MINUTES = env_int("COUNTDOWN_BUCKET_MINUTES", 60)
 NEWS_SUMMARY_WORD_LIMIT = env_int("NEWS_SUMMARY_WORD_LIMIT", 60)
 API_DAILY_LIMIT = env_int("API_DAILY_LIMIT", 95)
+HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", 30.0)
+HTTP_RETRY_COUNT = env_int("HTTP_RETRY_COUNT", 3)
+HTTP_RETRY_DELAY_SECONDS = env_float("HTTP_RETRY_DELAY_SECONDS", 2.0)
 
 ENDPOINT_CADENCE_MINUTES = {
     "cricScore": env_int("CRICSCORE_CADENCE_MINUTES", 30),
@@ -169,9 +172,20 @@ async def api_get(
     if api_budget_remaining(state) <= 0:
         return state["payload_cache"].get(name)
 
-    response = await client.get(f"{API_ROOT}/{name}", params={"apikey": CRICKET_API_KEY, **params})
-    response.raise_for_status()
-    payload = response.json()
+    payload = None
+    for attempt in range(HTTP_RETRY_COUNT):
+        try:
+            response = await client.get(f"{API_ROOT}/{name}", params={"apikey": CRICKET_API_KEY, **params})
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError):
+            if attempt == HTTP_RETRY_COUNT - 1:
+                return state["payload_cache"].get(name)
+            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if payload is None:
+        return state["payload_cache"].get(name)
 
     state["api_usage"]["count"] = int(state["api_usage"].get("count", 0)) + 1
     update_endpoint_meta(state, name, now)
@@ -468,8 +482,14 @@ async def post_message(client: httpx.AsyncClient, chat_id: str, message: str) ->
         return
     payload = {"chat_id": chat_id, "text": attach_cta(message, brand)}
     response: httpx.Response | None = None
-    for _ in range(3):
-        response = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+    for attempt in range(max(3, HTTP_RETRY_COUNT)):
+        try:
+            response = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError):
+            if attempt == max(3, HTTP_RETRY_COUNT) - 1:
+                raise
+            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
         if response.status_code != 429:
             response.raise_for_status()
             await asyncio.sleep(TELEGRAM_POST_DELAY_SECONDS)
@@ -490,16 +510,24 @@ async def post_to_targets(client: httpx.AsyncClient, message: str) -> None:
 async def send_daily_poll(client: httpx.AsyncClient, team_a: str, team_b: str) -> None:
     if not GROUP_CHAT_ID:
         return
-    response = await client.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll",
-        json={
-            "chat_id": GROUP_CHAT_ID,
-            "question": "Aaj ka IPL match kaun jeetega?",
-            "options": [team_a, team_b],
-            "is_anonymous": False,
-        },
-    )
-    response.raise_for_status()
+    payload = {
+        "chat_id": GROUP_CHAT_ID,
+        "question": "Aaj ka IPL match kaun jeetega?",
+        "options": [team_a, team_b],
+        "is_anonymous": False,
+    }
+    response: httpx.Response | None = None
+    for attempt in range(HTTP_RETRY_COUNT):
+        try:
+            response = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll", json=payload)
+            response.raise_for_status()
+            break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError):
+            if attempt == HTTP_RETRY_COUNT - 1:
+                raise
+            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+    if response is None:
+        return
     await asyncio.sleep(TELEGRAM_POST_DELAY_SECONDS)
 
 
@@ -508,8 +536,18 @@ async def fetch_news_items(
     live_items: list[dict[str, Any]],
     next_match: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    response = await client.get(build_news_url(build_news_query(live_items, next_match)))
-    response.raise_for_status()
+    response = None
+    for attempt in range(HTTP_RETRY_COUNT):
+        try:
+            response = await client.get(build_news_url(build_news_query(live_items, next_match)))
+            response.raise_for_status()
+            break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError):
+            if attempt == HTTP_RETRY_COUNT - 1:
+                return []
+            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+    if response is None:
+        return []
     root = ElementTree.fromstring(response.text)
     items: list[dict[str, str]] = []
     for item in root.findall(".//item"):
@@ -554,7 +592,7 @@ async def run_once() -> None:
     today = now.strftime("%Y-%m-%d")
     reset_daily_usage(state, today)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         cric_score = await api_get(client, state, "cricScore", {}, now) or []
         matches = await api_get(client, state, "matches", {"offset": 0}, now) or []
         current_matches = await api_get(client, state, "currentMatches", {"offset": 0}, now) or []
