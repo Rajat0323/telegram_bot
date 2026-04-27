@@ -1,9 +1,13 @@
 import asyncio
+import html
 import logging
 import os
+import re
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote_plus
+from xml.etree import ElementTree
 
 from dotenv import load_dotenv
 import httpx
@@ -14,6 +18,7 @@ from content_templates import (
     BrandConfig,
     attach_cta,
     auto_live_update,
+    cricket_news_caption,
     debate_post,
     engagement_poll,
     giveaway_post,
@@ -22,6 +27,7 @@ from content_templates import (
     result_summary,
     score_update,
     toss_update,
+    trivia_question,
     welcome_message,
     wicket_alert,
 )
@@ -135,6 +141,12 @@ def parse_match_time(match: dict[str, Any]) -> datetime | None:
     return None
 
 
+NEWS_RSS_URL = os.getenv(
+    "NEWS_RSS_URL",
+    "https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en",
+)
+
+
 async def fetch_current_matches() -> list[dict[str, Any]]:
     if not CRICKET_API_KEY:
         return []
@@ -148,6 +160,152 @@ async def fetch_current_matches() -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         return payload.get("data") or []
     return []
+
+
+def strip_html_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_image_from_html(raw: str) -> str | None:
+    patterns = [
+        r'<img[^>]+src="([^"]+)"',
+        r"<img[^>]+src='([^']+)'",
+        r"https://[^\s\"']+\.(?:jpg|jpeg|png|webp)(?:\?[^\s\"']*)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            url = html.unescape(match.group(1) if "(" in pattern else match.group(0))
+            if url.startswith("http"):
+                return url
+    return None
+
+
+async def fetch_cricket_news(query: str = "IPL 2026 cricket", limit: int = 3) -> list[dict[str, str]]:
+    rss_url = NEWS_RSS_URL
+    if "{query}" in rss_url:
+        rss_url = rss_url.format(query=quote_plus(query))
+    items: list[dict[str, str]] = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(rss_url, follow_redirects=True)
+            response.raise_for_status()
+        root = ElementTree.fromstring(response.text)
+        for item in root.findall(".//item"):
+            title = item.findtext("title", default="").strip()
+            link = item.findtext("link", default="").strip()
+            guid = item.findtext("guid", default=link).strip()
+            raw_desc = item.findtext("description", default="").strip()
+            description = strip_html_tags(raw_desc)
+            source = item.findtext("source", default="Cricket News").strip()
+            image_url = extract_image_from_html(raw_desc)
+            if not title or not link:
+                continue
+            items.append({
+                "id": guid,
+                "title": title,
+                "description": description[:200] + "..." if len(description) > 200 else description,
+                "source": source or "Cricket News",
+                "link": link,
+                "image_url": image_url or "",
+            })
+            if len(items) >= limit:
+                break
+    except Exception:
+        logging.exception("Failed to fetch cricket news")
+    return items
+
+
+async def send_photo_to_all(bot: Any, image_url: str, caption: str) -> None:
+    full_caption = attach_cta(caption, brand)
+    for chat_id in [CHANNEL_CHAT_ID, GROUP_CHAT_ID]:
+        if not chat_id:
+            continue
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=image_url, caption=full_caption)
+        except Exception:
+            try:
+                await bot.send_message(chat_id=chat_id, text=full_caption)
+            except Exception:
+                logging.exception("Failed to send message to %s", chat_id)
+        await asyncio.sleep(1)
+
+
+async def send_text_to_all(bot: Any, message: str) -> None:
+    full_message = attach_cta(message, brand)
+    for chat_id in [CHANNEL_CHAT_ID, GROUP_CHAT_ID]:
+        if not chat_id:
+            continue
+        try:
+            await bot.send_message(chat_id=chat_id, text=full_message)
+        except Exception:
+            logging.exception("Failed to send message to %s", chat_id)
+        await asyncio.sleep(1)
+
+
+def has_live_ipl_match(matches: list[dict[str, Any]]) -> bool:
+    for match in matches:
+        if not match_contains_keyword(match):
+            continue
+        started = bool(match.get("matchStarted"))
+        ended = bool(match.get("matchEnded"))
+        if started and not ended:
+            return True
+    return False
+
+
+async def no_match_news_loop(application: Application) -> None:
+    interval = max(AUTO_UPDATE_INTERVAL_SECONDS, MIN_SAFE_INTERVAL_SECONDS)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            matches = await fetch_current_matches()
+            if has_live_ipl_match(matches):
+                logging.info("Live match in progress — skipping news loop")
+                continue
+
+            posted_news: set[str] = application.bot_data.setdefault("posted_news_ids", set())
+            news_items = await fetch_cricket_news("IPL 2026 cricket latest news", limit=1)
+
+            for item in news_items:
+                if item["id"] in posted_news:
+                    continue
+                posted_news.add(item["id"])
+                caption = cricket_news_caption(
+                    item["title"], item["description"], item["source"], item["link"]
+                )
+                if item.get("image_url"):
+                    await send_photo_to_all(application.bot, item["image_url"], caption)
+                else:
+                    await send_text_to_all(application.bot, caption)
+                logging.info("News posted (no live match): %s", item["title"])
+                break
+
+        except Exception:
+            logging.exception("No-match news loop failed")
+
+
+async def trivia_loop(application: Application) -> None:
+    trivia_interval = 2 * 3600
+    await asyncio.sleep(1800)
+    while True:
+        try:
+            matches = await fetch_current_matches()
+            if not has_live_ipl_match(matches) and GROUP_CHAT_ID:
+                question, options = trivia_question()
+                await application.bot.send_poll(
+                    chat_id=GROUP_CHAT_ID,
+                    question=question,
+                    options=options,
+                    is_anonymous=False,
+                    type=Poll.REGULAR,
+                )
+                logging.info("Trivia poll posted")
+        except Exception:
+            logging.exception("Trivia loop failed")
+        await asyncio.sleep(trivia_interval)
 
 
 async def auto_live_loop(application: Application) -> None:
@@ -264,16 +422,21 @@ async def post_init(application: Application) -> None:
     application.bot_data["autolive_enabled"] = AUTO_UPDATE_ENABLED
     application.bot_data["live_state"] = {}
     application.bot_data["welcomed_users"] = set()
+    application.bot_data["posted_news_ids"] = set()
     if CRICKET_API_KEY:
         application.bot_data["live_task"] = asyncio.create_task(auto_live_loop(application))
         application.bot_data["debate_task"] = asyncio.create_task(debate_loop(application))
-        logging.info("Auto live updater enabled")
+        application.bot_data["news_task"] = asyncio.create_task(no_match_news_loop(application))
+        application.bot_data["trivia_task"] = asyncio.create_task(trivia_loop(application))
+        logging.info("Auto live updater, news loop, and trivia loop enabled")
     else:
-        logging.info("Auto live updater skipped because CRICKET_API_KEY is missing")
+        application.bot_data["news_task"] = asyncio.create_task(no_match_news_loop(application))
+        application.bot_data["trivia_task"] = asyncio.create_task(trivia_loop(application))
+        logging.info("Live updater skipped (no API key) — news and trivia loops running")
 
 
 async def post_shutdown(application: Application) -> None:
-    for key in ("live_task", "debate_task"):
+    for key in ("live_task", "debate_task", "news_task", "trivia_task"):
         task = application.bot_data.get(key)
         if task:
             task.cancel()

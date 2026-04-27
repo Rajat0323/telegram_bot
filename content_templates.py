@@ -111,6 +111,37 @@ def styled_news_message(summary: str, source: str, link: str) -> str:
     )
 
 
+def cricket_news_caption(title: str, summary: str, source: str, link: str) -> str:
+    return (
+        f"CRICKET NEWS\n\n"
+        f"{title}\n\n"
+        f"{summary}\n\n"
+        f"Source: {source}\n"
+        f"Read more: {link}"
+    )
+
+
+CRICKET_TRIVIA = [
+    ("IPL Ka Sabse Bada Six Kisne Mara?", ["MS Dhoni", "Yuvraj Singh", "Chris Gayle", "Ab De Villiers"]),
+    ("IPL 2024 Ki Orange Cap Kisne Jeeti?", ["Virat Kohli", "KL Rahul", "Ruturaj Gaikwad", "Shubman Gill"]),
+    ("IPL Ka Sabse Successful Captain Kaun Hai?", ["MS Dhoni", "Rohit Sharma", "Gautam Gambhir", "David Warner"]),
+    ("Kaunsi Team Ne Sabse Zyada IPL Titles Jeete?", ["Mumbai Indians", "Chennai Super Kings", "Kolkata Knight Riders", "Rajasthan Royals"]),
+    ("IPL Me Sabse Fast Century Kisne Score Ki?", ["Chris Gayle", "Yuvraj Singh", "AB de Villiers", "David Miller"]),
+    ("IPL 2024 Purple Cap Kisne Jeeti?", ["Harshal Patel", "Jasprit Bumrah", "Yuzvendra Chahal", "Mohammed Shami"]),
+    ("Kaunse Batsman Ne IPL Me 8000+ Runs Banaye?", ["Virat Kohli", "Suresh Raina", "Rohit Sharma", "Dono A aur B"]),
+    ("T20 Me 6 Sixes Ek Over Me Kisne Maare?", ["Yuvraj Singh", "Kieron Pollard", "Rohit Sharma", "Chris Gayle"]),
+]
+
+_trivia_index: list[int] = [0]
+
+
+def trivia_question() -> tuple[str, list[str]]:
+    idx = _trivia_index[0] % len(CRICKET_TRIVIA)
+    _trivia_index[0] += 1
+    question, options = CRICKET_TRIVIA[idx]
+    return question, options
+
+
 def styled_countdown_message(
     team_a: str,
     team_b: str,
