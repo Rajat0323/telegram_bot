@@ -28,3 +28,16 @@ args = "python bot.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[userenv]
+
+[userenv.shared]
+CHANNEL_CHAT_ID = "@ipllivescore11"
+GROUP_CHAT_ID = "@ipllivesvore777"
+BRAND_HANDLE = "@ipllivescore11"
+DEFAULT_HASHTAGS = "#IPL2026 #LiveScore #FantasyTips"
+CRICKET_API_BASE_URL = "https://api.cricapi.com/v1/currentMatches"
+TOURNAMENT_KEYWORDS = "ipl,indian premier league"
+NEWS_RSS_URL = "https://news.google.com/rss/search?q=IPL&hl=en-IN&gl=IN&ceid=IN:en"
+AUTO_UPDATE_ENABLED = "true"
+AUTO_UPDATE_INTERVAL_SECONDS = "900"
