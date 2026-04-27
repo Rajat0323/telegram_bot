@@ -2,23 +2,27 @@ import asyncio
 import logging
 import os
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
 import httpx
-from telegram import Poll
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import ChatMemberUpdated, Poll
+from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes
 
 from content_templates import (
     BrandConfig,
     attach_cta,
     auto_live_update,
+    debate_post,
     engagement_poll,
     giveaway_post,
     morning_preview,
+    points_table_impact,
     result_summary,
     score_update,
     toss_update,
+    welcome_message,
     wicket_alert,
 )
 
@@ -46,7 +50,21 @@ AUTO_UPDATE_ENABLED = os.getenv("AUTO_UPDATE_ENABLED", "true").lower() == "true"
 AUTO_UPDATE_INTERVAL_SECONDS = int(os.getenv("AUTO_UPDATE_INTERVAL_SECONDS", "60"))
 MIN_SAFE_INTERVAL_SECONDS = 900
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 brand = BrandConfig(handle=BRAND_HANDLE, hashtags=DEFAULT_HASHTAGS)
+
+
+def ist_now() -> datetime:
+    return datetime.now(UTC).astimezone(IST)
+
+
+def match_is_today_or_tomorrow(match_time: datetime) -> bool:
+    now_ist = ist_now()
+    match_ist = match_time.astimezone(IST)
+    today = now_ist.date()
+    match_date = match_ist.date()
+    return match_date == today or match_date == (today + timedelta(days=1))
 
 
 async def send_to_channel(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
@@ -108,6 +126,15 @@ def build_match_digest(match: dict[str, Any]) -> str:
     return f"{status}::{scores}::{toss}"
 
 
+def parse_match_time(match: dict[str, Any]) -> datetime | None:
+    raw = match.get("dateTimeGMT")
+    if not raw:
+        return None
+    with suppress(ValueError):
+        return datetime.fromisoformat(str(raw)).replace(tzinfo=UTC)
+    return None
+
+
 async def fetch_current_matches() -> list[dict[str, Any]]:
     if not CRICKET_API_KEY:
         return []
@@ -134,6 +161,39 @@ async def auto_live_loop(application: Application) -> None:
         await asyncio.sleep(interval)
 
 
+async def debate_loop(application: Application) -> None:
+    debate_interval = 4 * 3600
+    while True:
+        await asyncio.sleep(debate_interval)
+        try:
+            if not GROUP_CHAT_ID:
+                continue
+            matches = await fetch_current_matches()
+            ipl_matches = [m for m in matches if match_contains_keyword(m)]
+            target_match = None
+            for match in ipl_matches:
+                mt = parse_match_time(match)
+                if mt and match_is_today_or_tomorrow(mt):
+                    target_match = match
+                    break
+            if not target_match and ipl_matches:
+                target_match = ipl_matches[0]
+            if not target_match:
+                continue
+            team_a, team_b = extract_teams(target_match)
+            question, options = debate_post(team_a, team_b)
+            await application.bot.send_poll(
+                chat_id=GROUP_CHAT_ID,
+                question=question,
+                options=options,
+                is_anonymous=False,
+                type=Poll.REGULAR,
+            )
+            logging.info("Debate poll posted to group")
+        except Exception:
+            logging.exception("Debate loop failed")
+
+
 async def process_live_updates(application: Application) -> None:
     matches = await fetch_current_matches()
     live_state = application.bot_data.setdefault("live_state", {})
@@ -150,56 +210,116 @@ async def process_live_updates(application: Application) -> None:
         if live_state.get(match_id) == digest:
             continue
 
+        previous_digest = live_state.get(match_id, "")
         live_state[match_id] = digest
         team_a, team_b = extract_teams(match)
         status = str(match.get("status", "Live"))
         score_lines = format_score_lines(match)
 
         title = "Live IPL Update"
+        is_wicket = False
+        is_result = False
+
         if "won" in status.lower():
             title = "Match Result"
+            is_result = True
         elif "toss" in status.lower():
             title = "Toss Update"
+        elif previous_digest:
+            prev_scores = previous_digest.split("::")
+            if len(prev_scores) > 1:
+                import re
+                prev_w_match = re.search(r"/(\d+)", prev_scores[1])
+                for line in score_lines:
+                    curr_w_match = re.search(r"/(\d+)", line)
+                    if prev_w_match and curr_w_match:
+                        if int(curr_w_match.group(1)) > int(prev_w_match.group(1)):
+                            title = "WICKET ALERT!"
+                            is_wicket = True
+                            break
 
-        message = auto_live_update(title, team_a, team_b, status, score_lines)
         fake_context = type("Context", (), {"bot": application.bot})()
+        message = auto_live_update(title, team_a, team_b, status, score_lines)
         await send_to_targets(fake_context, message)
+
+        if is_result:
+            winner = team_a if team_a.lower() in status.lower() else team_b
+            loser = team_b if winner == team_a else team_a
+            match_name = str(match.get("name", f"{team_a} vs {team_b}"))
+            impact_msg = points_table_impact(winner, loser, match_name)
+            await send_to_targets(fake_context, impact_msg)
+
+            if GROUP_CHAT_ID:
+                question, options = debate_post(team_a, team_b)
+                await application.bot.send_poll(
+                    chat_id=GROUP_CHAT_ID,
+                    question=f"Post-match: {question}",
+                    options=options,
+                    is_anonymous=False,
+                    type=Poll.REGULAR,
+                )
 
 
 async def post_init(application: Application) -> None:
     application.bot_data["autolive_enabled"] = AUTO_UPDATE_ENABLED
     application.bot_data["live_state"] = {}
+    application.bot_data["welcomed_users"] = set()
     if CRICKET_API_KEY:
         application.bot_data["live_task"] = asyncio.create_task(auto_live_loop(application))
+        application.bot_data["debate_task"] = asyncio.create_task(debate_loop(application))
         logging.info("Auto live updater enabled")
     else:
         logging.info("Auto live updater skipped because CRICKET_API_KEY is missing")
 
 
 async def post_shutdown(application: Application) -> None:
-    live_task = application.bot_data.get("live_task")
-    if live_task:
-        live_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await live_task
+    for key in ("live_task", "debate_task"):
+        task = application.bot_data.get(key)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def welcome_new_member(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    result: ChatMemberUpdated = update.chat_member
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+    if old_status in ("left", "kicked") and new_status == "member":
+        user = result.new_chat_member.user
+        if user.is_bot:
+            return
+        welcomed = context.application.bot_data.get("welcomed_users", set())
+        if user.id in welcomed:
+            return
+        welcomed.add(user.id)
+        context.application.bot_data["welcomed_users"] = welcomed
+        name = user.first_name or "Friend"
+        msg = welcome_message(name, brand)
+        await context.bot.send_message(chat_id=result.chat.id, text=msg)
+        logging.info("Welcome message sent to %s", name)
 
 
 async def start_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Bot ready hai. /help use karo aur templates se fast updates bhejo."
+        "Bot ready hai! /help use karo aur templates se fast updates bhejo."
     )
 
 
 async def help_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
+        "Available commands:\n\n"
         "/preview team_a team_b venue pitch captain vice_captain\n"
         "/poll team_a team_b\n"
+        "/debate team_a team_b\n"
         "/toss text\n"
         "/score team score overs\n"
         "/wicket player team_score overs\n"
         "/result result_text | player_of_match\n"
+        "/points winner loser match_name\n"
         "/giveaway amount\n"
         "/post text\n"
+        "/countdown\n"
         "/live_on\n"
         "/live_off\n"
         "/live_status"
@@ -239,6 +359,27 @@ async def poll_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=attach_cta(poll_text, brand))
     await update.message.reply_text("Poll group me bhej diya.")
+
+
+async def debate_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /debate team_a team_b")
+        return
+
+    if not GROUP_CHAT_ID:
+        await update.message.reply_text("GROUP_CHAT_ID configure nahi hai.")
+        return
+
+    team_a, team_b = context.args[:2]
+    question, options = debate_post(team_a, team_b)
+    await context.bot.send_poll(
+        chat_id=GROUP_CHAT_ID,
+        question=question,
+        options=options,
+        is_anonymous=False,
+        type=Poll.REGULAR,
+    )
+    await update.message.reply_text("Debate poll group me bhej diya.")
 
 
 async def toss_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -285,6 +426,52 @@ async def result_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = result_summary(result_text, player_of_match)
     await send_to_targets(context, message)
     await update.message.reply_text("Result summary bhej diya.")
+
+
+async def points_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /points winner loser match_name")
+        return
+
+    winner = context.args[0]
+    loser = context.args[1]
+    match_name = " ".join(context.args[2:])
+    message = points_table_impact(winner, loser, match_name)
+    await send_to_targets(context, message)
+    await update.message.reply_text("Points table update bhej diya.")
+
+
+async def countdown_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    matches = await fetch_current_matches()
+    now = datetime.now(UTC)
+    target = None
+    for match in matches:
+        if not match_contains_keyword(match):
+            continue
+        mt = parse_match_time(match)
+        if mt and mt > now and match_is_today_or_tomorrow(mt):
+            target = match
+            break
+
+    if not target:
+        await update.message.reply_text("Aaj ya kal ka koi IPL match schedule nahi mila.")
+        return
+
+    team_a, team_b = extract_teams(target)
+    mt = parse_match_time(target)
+    ist_time = mt.astimezone(IST)
+    remaining = mt - now
+    hours = int(remaining.total_seconds() // 3600)
+    minutes = int((remaining.total_seconds() % 3600) // 60)
+    date_str = ist_time.strftime("%d %b %Y, %I:%M %p IST")
+    countdown_text = f"Starts in {hours}h {minutes}m" if hours > 0 else f"Starts in {minutes} min"
+    venue = str(target.get("venue", "Venue TBA"))
+    status = str(target.get("status", "Upcoming"))
+
+    from content_templates import styled_countdown_message
+    msg = styled_countdown_message(team_a, team_b, venue, countdown_text, status, date_str)
+    await send_to_targets(context, msg)
+    await update.message.reply_text("Countdown bhej diya.")
 
 
 async def giveaway_command(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,7 +525,6 @@ def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is not configured")
 
-    # Python 3.14 no longer creates a default event loop automatically.
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     application = (
@@ -349,14 +535,18 @@ def main() -> None:
         .build()
     )
 
+    application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("preview", preview_command))
     application.add_handler(CommandHandler("poll", poll_command))
+    application.add_handler(CommandHandler("debate", debate_command))
     application.add_handler(CommandHandler("toss", toss_command))
     application.add_handler(CommandHandler("score", score_command))
     application.add_handler(CommandHandler("wicket", wicket_command))
     application.add_handler(CommandHandler("result", result_command))
+    application.add_handler(CommandHandler("points", points_command))
+    application.add_handler(CommandHandler("countdown", countdown_command))
     application.add_handler(CommandHandler("giveaway", giveaway_command))
     application.add_handler(CommandHandler("post", post_command))
     application.add_handler(CommandHandler("live_on", live_on_command))
@@ -364,7 +554,7 @@ def main() -> None:
     application.add_handler(CommandHandler("live_status", live_status_command))
 
     logging.info("Bot started")
-    application.run_polling()
+    application.run_polling(allowed_updates=["message", "chat_member"])
 
 
 if __name__ == "__main__":

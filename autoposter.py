@@ -4,11 +4,13 @@ import html
 import json
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 from xml.etree import ElementTree
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 import httpx
 from dotenv import load_dotenv
@@ -17,6 +19,7 @@ from content_templates import (
     BrandConfig,
     attach_cta,
     auto_live_update,
+    points_table_impact,
     styled_countdown_message,
     styled_live_update,
     styled_news_message,
@@ -265,6 +268,14 @@ def parse_match_time(match: dict[str, Any]) -> datetime | None:
     return None
 
 
+def match_is_today_or_tomorrow(match_time: datetime, now: datetime) -> bool:
+    now_ist = now.astimezone(IST)
+    match_ist = match_time.astimezone(IST)
+    today = now_ist.date()
+    match_date = match_ist.date()
+    return match_date == today or match_date == (today + timedelta(days=1))
+
+
 def parse_runs_wickets(score_text: str) -> tuple[int | None, int | None]:
     match = re.search(r"(\d+)-(\d+)", score_text)
     if not match:
@@ -331,7 +342,12 @@ def select_next_match(matches: list[dict[str, Any]], series_info: dict[str, Any]
     candidates = [c for c in candidates if (parse_match_time(c) or now) >= now]
     if not candidates:
         return None
-    return min(candidates, key=lambda item: parse_match_time(item) or datetime.max.replace(tzinfo=UTC))
+    sorted_candidates = sorted(candidates, key=lambda item: parse_match_time(item) or datetime.max.replace(tzinfo=UTC))
+    for candidate in sorted_candidates:
+        mt = parse_match_time(candidate)
+        if mt and match_is_today_or_tomorrow(mt, now):
+            return candidate
+    return None
 
 
 def describe_countdown(match_time: datetime, now: datetime) -> tuple[str, int]:
@@ -352,9 +368,12 @@ def build_next_match_message(match: dict[str, Any], now: datetime) -> tuple[str,
     if match_time is None:
         countdown_text = "Schedule update soon"
         bucket_key = f"{match.get('id', 'unknown')}:unknown"
+        date_str = ""
     else:
         countdown_text, bucket = describe_countdown(match_time, now)
         bucket_key = f"{match.get('id', 'unknown')}:{bucket}"
+        ist_time = match_time.astimezone(IST)
+        date_str = ist_time.strftime("%d %b %Y, %I:%M %p IST")
 
     message = styled_countdown_message(
         team_a=team_a,
@@ -362,6 +381,7 @@ def build_next_match_message(match: dict[str, Any], now: datetime) -> tuple[str,
         venue=venue,
         countdown_text=countdown_text,
         status=status,
+        match_date_str=date_str,
     )
     return message, bucket_key
 
@@ -700,14 +720,24 @@ async def run_once() -> None:
             if previous_digest == digest or state["details_posted"]["scorecard"].get(match_id):
                 continue
 
+            team_a_res, team_b_res = extract_teams(match)
+            result_status = str(match.get("status", ""))
             await post_to_targets(
                 client,
                 styled_live_update(
                     "Match Result",
-                    *extract_teams(match),
-                    str(match.get("status", "")),
+                    team_a_res,
+                    team_b_res,
+                    result_status,
                     score_lines_from_current(match),
                 ),
+            )
+
+            winner_res = team_a_res if team_a_res.lower() in result_status.lower() else team_b_res
+            loser_res = team_b_res if winner_res == team_a_res else team_a_res
+            await post_to_targets(
+                client,
+                points_table_impact(winner_res, loser_res, str(match.get("name", f"{team_a_res} vs {team_b_res}"))),
             )
 
             scorecard = await api_get(client, state, "match_scorecard", {"id": match_id}, now, force=True)
