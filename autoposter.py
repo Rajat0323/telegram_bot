@@ -13,7 +13,14 @@ from xml.etree import ElementTree
 import httpx
 from dotenv import load_dotenv
 
-from content_templates import BrandConfig, attach_cta, auto_live_update
+from content_templates import (
+    BrandConfig,
+    attach_cta,
+    auto_live_update,
+    styled_countdown_message,
+    styled_live_update,
+    styled_news_message,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -72,6 +79,7 @@ API_DAILY_LIMIT = env_int("API_DAILY_LIMIT", 95)
 HTTP_TIMEOUT_SECONDS = env_float("HTTP_TIMEOUT_SECONDS", 30.0)
 HTTP_RETRY_COUNT = env_int("HTTP_RETRY_COUNT", 3)
 HTTP_RETRY_DELAY_SECONDS = env_float("HTTP_RETRY_DELAY_SECONDS", 2.0)
+ENABLE_NEWS_IMAGES = env_str("ENABLE_NEWS_IMAGES", "true").lower() == "true"
 
 ENDPOINT_CADENCE_MINUTES = {
     "cricScore": env_int("CRICSCORE_CADENCE_MINUTES", 30),
@@ -205,6 +213,19 @@ def strip_html(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def extract_image_url(raw_html: str) -> str | None:
+    patterns = [
+        r'<img[^>]+src="([^"]+)"',
+        r"<img[^>]+src='([^']+)'",
+        r"https://[^\\s\"']+\\.(?:jpg|jpeg|png|webp)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_html, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1))
+    return None
+
+
 def summarize_words(text: str, limit: int) -> str:
     words = text.split()
     if len(words) <= limit:
@@ -335,12 +356,12 @@ def build_next_match_message(match: dict[str, Any], now: datetime) -> tuple[str,
         countdown_text, bucket = describe_countdown(match_time, now)
         bucket_key = f"{match.get('id', 'unknown')}:{bucket}"
 
-    message = (
-        "Next IPL Match\n"
-        f"{team_a} vs {team_b}\n"
-        f"Venue: {venue}\n"
-        f"{countdown_text}\n"
-        f"Status: {status}"
+    message = styled_countdown_message(
+        team_a=team_a,
+        team_b=team_b,
+        venue=venue,
+        countdown_text=countdown_text,
+        status=status,
     )
     return message, bucket_key
 
@@ -417,8 +438,8 @@ def title_matches_context(title: str, live_items: list[dict[str, Any]], next_mat
 def build_news_message(title: str, description: str, link: str, source: str) -> str:
     body = description or title
     summary = summarize_words(f"{title}. {body}", NEWS_SUMMARY_WORD_LIMIT)
-    source_line = f"Source: {source}" if source else "Source: News feed"
-    return f"IPL Match News\n{summary}\n{source_line}\nRead more: {link}"
+    source_text = source or "News feed"
+    return styled_news_message(summary, source_text, link)
 
 
 def build_scorecard_message(match_name: str, scorecard: dict[str, Any]) -> str | None:
@@ -502,9 +523,42 @@ async def post_message(client: httpx.AsyncClient, chat_id: str, message: str) ->
         response.raise_for_status()
 
 
+async def post_photo_message(client: httpx.AsyncClient, chat_id: str, image_url: str, caption: str) -> None:
+    if not chat_id or not image_url:
+        return
+    payload = {"chat_id": chat_id, "photo": image_url, "caption": attach_cta(caption, brand)}
+    response: httpx.Response | None = None
+    for attempt in range(max(3, HTTP_RETRY_COUNT)):
+        try:
+            response = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", json=payload)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError):
+            if attempt == max(3, HTTP_RETRY_COUNT) - 1:
+                raise
+            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        if response.status_code != 429:
+            if response.status_code == 400:
+                await post_message(client, chat_id, caption)
+                return
+            response.raise_for_status()
+            await asyncio.sleep(TELEGRAM_POST_DELAY_SECONDS)
+            return
+        retry_after = 5
+        with contextlib.suppress(Exception):
+            retry_after = int(response.json().get("parameters", {}).get("retry_after", retry_after))
+        await asyncio.sleep(retry_after + 1)
+    if response is not None:
+        response.raise_for_status()
+
+
 async def post_to_targets(client: httpx.AsyncClient, message: str) -> None:
     await post_message(client, CHANNEL_CHAT_ID, message)
     await post_message(client, GROUP_CHAT_ID, message)
+
+
+async def post_photo_to_targets(client: httpx.AsyncClient, image_url: str, caption: str) -> None:
+    await post_photo_message(client, CHANNEL_CHAT_ID, image_url, caption)
+    await post_photo_message(client, GROUP_CHAT_ID, image_url, caption)
 
 
 async def send_daily_poll(client: httpx.AsyncClient, team_a: str, team_b: str) -> None:
@@ -554,13 +608,24 @@ async def fetch_news_items(
         title = item.findtext("title", default="").strip()
         link = item.findtext("link", default="").strip()
         guid = item.findtext("guid", default=link).strip()
-        description = strip_html(item.findtext("description", default="").strip())
+        raw_description = item.findtext("description", default="").strip()
+        description = strip_html(raw_description)
         source = item.findtext("source", default="").strip()
+        image_url = extract_image_url(raw_description)
         if not title or not link:
             continue
         if not title_matches_context(title, live_items, next_match):
             continue
-        items.append({"id": guid, "title": title, "link": link, "description": description, "source": source})
+        items.append(
+            {
+                "id": guid,
+                "title": title,
+                "link": link,
+                "description": description,
+                "source": source,
+                "image_url": image_url or "",
+            }
+        )
         if len(items) >= MAX_NEWS_POSTS_PER_RUN:
             break
     return items
@@ -621,7 +686,7 @@ async def run_once() -> None:
                 continue
             state["matches"][match_id] = digest
             title = detect_live_event(previous_digest, {"status": status}, score_lines)
-            await post_to_targets(client, auto_live_update(title, team_a, team_b, status, score_lines))
+            await post_to_targets(client, styled_live_update(title, team_a, team_b, status, score_lines))
 
         for match in current_matches:
             if not match_contains_keyword(match):
@@ -637,7 +702,12 @@ async def run_once() -> None:
 
             await post_to_targets(
                 client,
-                auto_live_update("Match Result", *extract_teams(match), str(match.get("status", "")), score_lines_from_current(match)),
+                styled_live_update(
+                    "Match Result",
+                    *extract_teams(match),
+                    str(match.get("status", "")),
+                    score_lines_from_current(match),
+                ),
             )
 
             scorecard = await api_get(client, state, "match_scorecard", {"id": match_id}, now, force=True)
@@ -687,7 +757,11 @@ async def run_once() -> None:
             if item["id"] in state["news"]:
                 continue
             state["news"][item["id"]] = today
-            await post_to_targets(client, build_news_message(item["title"], item["description"], item["link"], item["source"]))
+            news_caption = build_news_message(item["title"], item["description"], item["link"], item["source"])
+            if ENABLE_NEWS_IMAGES and item.get("image_url"):
+                await post_photo_to_targets(client, item["image_url"], news_caption)
+            else:
+                await post_to_targets(client, news_caption)
 
     save_state(state)
 

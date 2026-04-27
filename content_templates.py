@@ -76,3 +76,45 @@ def auto_live_update(
         f"{scores}\n"
         f"Status: {status}"
     )
+
+
+def styled_live_update(
+    title: str,
+    team_a: str,
+    team_b: str,
+    status: str,
+    score_lines: list[str],
+) -> str:
+    score_block = "\n".join(f"- {line}" for line in score_lines) if score_lines else "- Score sync ho raha hai"
+    return (
+        f"{title}\n"
+        f"{team_a} vs {team_b}\n"
+        f"{score_block}\n"
+        f"Match Status: {status}\n"
+        f"Stay tuned for next big moment."
+    )
+
+
+def styled_news_message(summary: str, source: str, link: str) -> str:
+    return (
+        "IPL News Update\n"
+        f"{summary}\n"
+        f"Source: {source}\n"
+        f"Read more: {link}"
+    )
+
+
+def styled_countdown_message(
+    team_a: str,
+    team_b: str,
+    venue: str,
+    countdown_text: str,
+    status: str,
+) -> str:
+    return (
+        "Next Match Countdown\n"
+        f"{team_a} vs {team_b}\n"
+        f"Venue: {venue}\n"
+        f"{countdown_text}\n"
+        f"Update: {status}"
+    )
